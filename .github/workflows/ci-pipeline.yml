@@ -10,15 +10,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Checkout the repository code
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Set up Java Development Kit (JDK) version 21 for building the Spring Boot app
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: 'temurin'
 
+      # Cache Maven dependencies to speed up subsequent builds
       - name: Cache Maven dependencies
         uses: actions/cache@v4
         with:
@@ -26,15 +29,52 @@ jobs:
           key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
           restore-keys: ${{ runner.os }}-maven-
 
+      # Build the project using Maven in batch mode
       - name: Build with Maven
         run: mvn --batch-mode package
 
-      - name: Run tests
+      # Execute unit tests with Maven
+      - name: Run unit tests
         run: mvn --batch-mode test
 
-      - name: Upload test results
-        if: always()  
+      # Upload unit test reports as artifacts for later inspection
+      - name: Upload unit test results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-reports
           path: target/surefire-reports/
+
+      # Start the Spring Boot application in the background for integration testing
+      # Redirect logs to springboot.log and wait 30 seconds for startup
+      - name: Start Spring Boot app in background
+        run: |
+          nohup mvn spring-boot:run > springboot.log 2>&1 &
+          sleep 30  # Adjust sleep time based on application startup time
+
+      # Set up Node.js (version 18) environment required to run Newman
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      # Install Newman globally using npm to run Postman collections
+      - name: Install Newman
+        run: npm install -g newman
+
+      # Run the Postman collection for Supplier Management API using Newman
+      # Set baseUrl environment variable to point to local Spring Boot server
+      # Generate CLI output and JUnit XML report for test results
+      - name: Run Postman collection with Newman
+        run: |
+          newman run docs/api/supplier-management/supplier-management-v1.postman_collection.json \
+            --reporters cli,junit \
+            --reporter-junit-export postman-results.xml
+
+      # Upload Postman test results as artifacts for review
+      - name: Upload Postman test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postman-test-results
+          path: postman-results.xml
