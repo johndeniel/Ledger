@@ -1,0 +1,180 @@
+{
+	"info": {
+		"_postman_id": "51d161c8-36e8-4365-ac86-166bc4c6b376",
+		"name": "supplier",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "35404520"
+	},
+	"item": [
+		{
+			"name": "profile",
+			"item": [
+				{
+					"name": "save",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"// Test successful creation",
+									"pm.test(\"✅ Supplier created successfully\", function () {",
+									"    pm.response.to.have.status(201);",
+									"});",
+									"",
+									"// Save UUID for other requests",
+									"if (pm.response.code === 201) {",
+									"    const responseJson = pm.response.json();",
+									"    pm.collectionVariables.set('uuid', responseJson.uuid);",
+									"    console.log('🎯 UUID saved:', responseJson.uuid);",
+									"}"
+								],
+								"type": "text/javascript",
+								"packages": {}
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"name\": \"Acme Corporation\",\n    \"address\": \"123 Business Street, Tech City, TC 12345\",\n    \"taxId\": \"12-3456789\",\n    \"diversityStatus\": \"Minority-Owned Business\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/suppliers/profile",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"suppliers",
+								"profile"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "findById",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/suppliers/profile/{{uuid}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"suppliers",
+								"profile",
+								"{{uuid}}"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "findAllSuppliers",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/suppliers/profile",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"suppliers",
+								"profile"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "update",
+					"request": {
+						"method": "PUT",
+						"header": [],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"name\": \"Updated Supplier Name\",\n    \"address\": \"456 Updated Business Avenue, New City, NC 54321\",\n    \"taxId\": \"98-7654321\",\n    \"diversityStatus\": \"Women-Owned Business\"\n}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": {
+							"raw": "{{baseUrl}}/suppliers/profile/{{uuid}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"suppliers",
+								"profile",
+								"{{uuid}}"
+							]
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "deleteById",
+					"request": {
+						"method": "DELETE",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/suppliers/profile/{{uuid}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"suppliers",
+								"profile",
+								"{{uuid}}"
+							]
+						}
+					},
+					"response": []
+				}
+			]
+		}
+	],
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"exec": [
+					""
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:8080"
+		},
+		{
+			"key": "uuid",
+			"value": ""
+		}
+	]
+}
