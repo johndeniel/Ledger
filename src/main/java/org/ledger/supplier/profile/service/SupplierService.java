@@ -64,10 +64,6 @@ public class SupplierService {
             });
     }
 
-    public boolean existsById(UUID uuid) {
-        return supplierRepository.existsById(uuid);
-    }
-
     private SupplierResponseDTO toResponseDTO(SupplierEntity supplier) {
         return new SupplierResponseDTO(
             supplier.getUuid(),
