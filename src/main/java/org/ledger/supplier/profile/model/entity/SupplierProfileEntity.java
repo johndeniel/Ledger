@@ -10,7 +10,7 @@ import jakarta.persistence.Table;
 
 @Entity
 @Table(name = "Supplier")
-public class SupplierEntity {
+public class SupplierProfileEntity {
 
     @Id
     @Column(name = "uuid", nullable = false, updatable = false)
@@ -31,9 +31,9 @@ public class SupplierEntity {
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime created_at;
 
-    public SupplierEntity() {}
+    public SupplierProfileEntity() {}
 
-    public SupplierEntity(UUID uuid, String name, String address, String tax_id, String diversity_status, LocalDateTime created_at) {
+    public SupplierProfileEntity(UUID uuid, String name, String address, String tax_id, String diversity_status, LocalDateTime created_at) {
         this.uuid = uuid;
         this.name = name;
         this.address = address;

@@ -4,7 +4,7 @@ import com.fasterxml.jackson.annotation.JsonFormat;
 import java.time.LocalDateTime;
 import java.util.UUID;
 
-public class SupplierResponseDTO {
+public class SupplierProfileResponseDTO {
 
     private UUID uuid;
     private String name;
@@ -15,7 +15,7 @@ public class SupplierResponseDTO {
     @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
     private LocalDateTime createdAt;
 
-    public SupplierResponseDTO(UUID uuid, String name, String address, String taxId, String diversityStatus, LocalDateTime createdAt) {
+    public SupplierProfileResponseDTO(UUID uuid, String name, String address, String taxId, String diversityStatus, LocalDateTime createdAt) {
         this.uuid = uuid;
         this.name = name;
         this.address = address;

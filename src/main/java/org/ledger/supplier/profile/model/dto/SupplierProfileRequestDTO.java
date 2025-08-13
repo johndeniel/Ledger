@@ -3,7 +3,7 @@ package org.ledger.supplier.profile.model.dto;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 
-public class SupplierRequestDTO {
+public class SupplierProfileRequestDTO {
 
     @NotBlank(message = "Name is required")
     @Size(max = 255, message = "Name must not exceed 255 characters")
@@ -19,7 +19,7 @@ public class SupplierRequestDTO {
     private String diversityStatus;
 
 
-    public SupplierRequestDTO(String name, String address, String taxId, String diversityStatus) {
+    public SupplierProfileRequestDTO(String name, String address, String taxId, String diversityStatus) {
         this.name = name;
         this.address = address;
         this.taxId = taxId;

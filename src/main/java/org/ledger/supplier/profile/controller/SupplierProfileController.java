@@ -1,8 +1,8 @@
 package org.ledger.supplier.profile.controller;
 
-import org.ledger.supplier.profile.model.dto.SupplierRequestDTO;
-import org.ledger.supplier.profile.model.dto.SupplierResponseDTO;
-import org.ledger.supplier.profile.service.SupplierService;
+import org.ledger.supplier.profile.model.dto.SupplierProfileRequestDTO;
+import org.ledger.supplier.profile.model.dto.SupplierProfileResponseDTO;
+import org.ledger.supplier.profile.service.SupplierProfileService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -15,30 +15,30 @@ import java.util.UUID;
 
 @RestController
 @RequestMapping("/suppliers/profile")
-public class SupplierController {
+public class SupplierProfileController {
 
-    private final SupplierService supplierService;
+    private final SupplierProfileService supplierProfileService;
 
-    public SupplierController(SupplierService supplierService) {
-        this.supplierService = supplierService;
+    public SupplierProfileController(SupplierProfileService supplierProfileService) {
+        this.supplierProfileService = supplierProfileService;
     }
 
     @PostMapping
-    public ResponseEntity<SupplierResponseDTO> createSupplier(@Valid @RequestBody SupplierRequestDTO supplierRequestDTO) {
-        SupplierResponseDTO createdSupplier = supplierService.save(supplierRequestDTO);
+    public ResponseEntity<SupplierProfileResponseDTO> createSupplier(@Valid @RequestBody SupplierProfileRequestDTO supplierProfileRequest) {
+        SupplierProfileResponseDTO createdSupplier = supplierProfileService.saveSupplierProfile(supplierProfileRequest);
         URI location = URI.create("/suppliers/profile/" + createdSupplier.getUuid());
         return ResponseEntity.created(location).body(createdSupplier);
     }
 
     @GetMapping
-    public ResponseEntity<List<SupplierResponseDTO>> getAllSuppliers() {
-        List<SupplierResponseDTO> suppliers = supplierService.findAllSuppliers();
+    public ResponseEntity<List<SupplierProfileResponseDTO>> getAllSuppliers() {
+        List<SupplierProfileResponseDTO> suppliers = supplierProfileService.findAllSupplierProfiles();
         return ResponseEntity.ok(suppliers);
     }
 
     @GetMapping("/{uuid}")
-    public ResponseEntity<SupplierResponseDTO> getSupplierById(@PathVariable UUID uuid) {
-        SupplierResponseDTO supplier = supplierService.findById(uuid)
+    public ResponseEntity<SupplierProfileResponseDTO> getSupplierById(@PathVariable UUID uuid) {
+        SupplierProfileResponseDTO supplier = supplierProfileService.findSupplierProfileById(uuid)
             .orElseThrow(() -> new ResponseStatusException(
                 HttpStatus.NOT_FOUND, 
                 "Supplier not found with UUID: " + uuid));
@@ -47,10 +47,10 @@ public class SupplierController {
 
    
     @PutMapping("/{uuid}")
-    public ResponseEntity<SupplierResponseDTO> updateSupplier(
+    public ResponseEntity<SupplierProfileResponseDTO> updateSupplier(
             @PathVariable UUID uuid, 
-            @Valid @RequestBody SupplierRequestDTO supplierRequestDTO) {
-        SupplierResponseDTO updatedSupplier = supplierService.update(uuid, supplierRequestDTO)
+            @Valid @RequestBody SupplierProfileRequestDTO supplierProfileRequest) {
+        SupplierProfileResponseDTO updatedSupplier = supplierProfileService.updateSupplierProfile(uuid, supplierProfileRequest)
             .orElseThrow(() -> new ResponseStatusException(
                 HttpStatus.NOT_FOUND, 
                 "Supplier not found with UUID: " + uuid));
@@ -59,7 +59,7 @@ public class SupplierController {
 
     @DeleteMapping("/{uuid}")
     public ResponseEntity<Void> deleteSupplier(@PathVariable UUID uuid) {
-        boolean deleted = supplierService.deleteById(uuid).orElse(false);
+        boolean deleted = supplierProfileService.deleteSupplierProfile(uuid).orElse(false);
         if (!deleted) {
             throw new ResponseStatusException(
                 HttpStatus.NOT_FOUND, 
