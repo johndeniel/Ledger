@@ -1,0 +1,175 @@
+name: CI Pipeline
+
+# Trigger conditions: run pipeline only for changes to Java source or Maven config
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'pom.xml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'pom.xml'
+
+# Minimal required permissions for workflow execution
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+  actions: read
+
+# Global environment variables
+env:
+  JAVA_VERSION: '21'                    # Target Java version for build/test
+  JAVA_DISTRIBUTION: 'temurin'           # Eclipse Temurin JDK distribution
+  MAVEN_OPTS: '-Dmaven.repo.local=.m2/repository -Xmx1024m -XX:+UseG1GC'  # Optimized Maven JVM settings
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15                  # Fail fast to prevent stuck builds
+
+    outputs:
+      artifact-name: ${{ steps.build-info.outputs.artifact-name }}
+      version: ${{ steps.build-info.outputs.version }}
+
+    steps:
+      # Step 1: Fetch repository code with full history for versioning
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Step 2: Install Java runtime for build and tests
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+
+      # Step 3: Ensure Maven local repository exists to avoid cache path warnings
+      - name: Prepare Maven cache directory
+        run: mkdir -p ~/.m2/repository
+
+      # Step 4: Cache Maven dependencies for faster builds
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml', '.mvn/wrapper/maven-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      # Step 5: Pre-fetch dependencies for offline builds
+      - name: Download dependencies
+        run: mvn dependency:resolve --batch-mode --no-transfer-progress
+
+      # Step 6: Validate Maven project structure and configuration
+      - name: Validate Maven configuration
+        run: mvn validate --batch-mode --no-transfer-progress
+
+      # Step 7: Compile application source code
+      - name: Compile application
+        run: mvn compile --batch-mode --no-transfer-progress
+
+      # Step 8: Execute unit tests
+      - name: Run unit tests
+        run: mvn test --batch-mode --no-transfer-progress
+        env:
+          MAVEN_OPTS: ${{ env.MAVEN_OPTS }}
+
+      # Step 9: Package application JAR (tests skipped here for efficiency)
+      - name: Build application package
+        run: mvn package --batch-mode --no-transfer-progress -DskipTests
+
+      # Step 10: Capture artifact metadata for downstream use
+      - name: Extract build information
+        id: build-info
+        run: |
+          ARTIFACT_ID=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "artifact-name=${ARTIFACT_ID}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      # Step 11: Upload build outputs so they can be used in later workflow jobs or downloaded from the Actions UI
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-jar-${{ github.run_number }}
+          path: target/*.jar
+          retention-days: 7
+          compression-level: 6
+
+      # Step 12: Upload test result files so they are viewable in the Actions UI for debugging and reporting
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ github.run_number }}
+          path: target/surefire-reports/**/*.xml
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Step 13: Detect if test reports exist for publishing
+      - name: Check for test reports
+        id: check-reports
+        run: |
+          if find target/surefire-reports -name "*.xml" | grep -q .; then
+            echo "reports-exist=true" >> $GITHUB_OUTPUT
+          else
+            echo "reports-exist=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 14: Publish JUnit results to GitHub UI
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: steps.check-reports.outputs.reports-exist == 'true'
+        with:
+          name: Test Results
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+          fail-on-error: false
+          max-annotations: 10
+
+      # Step 15: Summarize build outcome in GitHub UI
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "## 🚀 Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Java Version** | ✅ | ${{ env.JAVA_VERSION }} (Temurin) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Build Number** | ✅ | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit SHA** | ✅ | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          
+          if JAR_FILE=$(ls target/*.jar 2>/dev/null | head -1); then
+            JAR_NAME=$(basename "$JAR_FILE")
+            JAR_SIZE=$(stat -c%s "$JAR_FILE")
+            echo "| **Build Artifact** | ✅ | \`${JAR_NAME}\` ($(numfmt --to=iec $JAR_SIZE)) |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| **Build Artifact** | ❌ | No JAR file found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ steps.check-reports.outputs.reports-exist }}" == "true" ]; then
+            TEST_COUNT=$(grep -c "<testcase" target/surefire-reports/*.xml | awk -F: '{sum+=$2} END {print sum}')
+            FAILURE_COUNT=$(grep -o 'failures="[1-9][0-9]*"' target/surefire-reports/*.xml | wc -l)
+            if [ "$FAILURE_COUNT" -eq 0 ]; then
+              echo "| **Tests** | ✅ | ${TEST_COUNT} passed |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| **Tests** | ⚠️ | ${TEST_COUNT} total, ${FAILURE_COUNT} failed |" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "| **Tests** | ⚠️ | No reports found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "- **Application JAR**: \`application-jar-${{ github.run_number }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Test Reports**: \`test-reports-${{ github.run_number }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "_Build completed at $(date -u '+%Y-%m-%d %H:%M:%S UTC')_" >> $GITHUB_STEP_SUMMARY
+
+      # Step 16: Cleanup Maven cache on build failure
+      - name: Cleanup on failure
+        if: failure()
+        run: rm -rf ~/.m2/repository/com ~/.m2/repository/org || true
