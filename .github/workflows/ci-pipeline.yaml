@@ -7,54 +7,54 @@ on:
     paths:
       - 'src/**'
       - 'pom.xml'
+      - '.github/**'
   pull_request:
     branches: [main]
     paths:
       - 'src/**'
       - 'pom.xml'
+      - '.github/**'
 
-# Minimal required permissions for workflow execution
+# Enhanced permissions for Pages deployment
 permissions:
   contents: read
   checks: write
   pull-requests: write
   actions: read
+  pages: write
+  id-token: write
 
 # Global environment variables
 env:
-  JAVA_VERSION: '21'                    # Target Java version for build/test
-  JAVA_DISTRIBUTION: 'temurin'           # Eclipse Temurin JDK distribution
-  MAVEN_OPTS: '-Dmaven.repo.local=.m2/repository -Xmx1024m -XX:+UseG1GC'  # Optimized Maven JVM settings
+  JAVA_VERSION: '21'
+  JAVA_DISTRIBUTION: 'temurin'
+  MAVEN_OPTS: '-Dmaven.repo.local=.m2/repository -Xmx1024m -XX:+UseG1GC'
 
 jobs:
   build-and-test:
     name: Build and Test
     runs-on: ubuntu-latest
-    timeout-minutes: 15                  # Fail fast to prevent stuck builds
+    timeout-minutes: 15
 
     outputs:
       artifact-name: ${{ steps.build-info.outputs.artifact-name }}
       version: ${{ steps.build-info.outputs.version }}
 
     steps:
-      # Step 1: Fetch repository code with full history for versioning
+      # Step 1: Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # Step 2: Install Java runtime for build and tests
+      # Step 2: Set up JDK
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: ${{ env.JAVA_DISTRIBUTION }}
 
-      # Step 3: Ensure Maven local repository exists to avoid cache path warnings
-      - name: Prepare Maven cache directory
-        run: mkdir -p ~/.m2/repository
-
-      # Step 4: Cache Maven dependencies for faster builds
+      # Step 3: Cache Maven dependencies
       - name: Cache Maven dependencies
         uses: actions/cache@v4
         with:
@@ -63,29 +63,34 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-maven-
 
-      # Step 5: Pre-fetch dependencies for offline builds
+      # Step 4: Download dependencies
       - name: Download dependencies
         run: mvn dependency:resolve --batch-mode --no-transfer-progress
 
-      # Step 6: Validate Maven project structure and configuration
-      - name: Validate Maven configuration
-        run: mvn validate --batch-mode --no-transfer-progress
+      # Step 5: Validate and compile
+      - name: Validate and compile
+        run: |
+          mvn validate --batch-mode --no-transfer-progress
+          mvn compile --batch-mode --no-transfer-progress
 
-      # Step 7: Compile application source code
-      - name: Compile application
-        run: mvn compile --batch-mode --no-transfer-progress
-
-      # Step 8: Execute unit tests
-      - name: Run unit tests
-        run: mvn test --batch-mode --no-transfer-progress
+      # Step 6: Run unit tests with coverage and generate HTML reports
+      - name: Run unit tests with coverage and generate reports
+        run: |
+          mvn clean test jacoco:report --batch-mode --no-transfer-progress
+          # Generate HTML Surefire report
+          mvn surefire-report:report-only --batch-mode --no-transfer-progress
+          # Generate Allure report if configured
+          if mvn help:describe -Dplugin=io.qameta.allure:allure-maven -Ddetail=false -q >/dev/null 2>&1; then
+            mvn allure:report --batch-mode --no-transfer-progress
+          fi
         env:
           MAVEN_OPTS: ${{ env.MAVEN_OPTS }}
 
-      # Step 9: Package application JAR (tests skipped here for efficiency)
+      # Step 7: Build application package
       - name: Build application package
         run: mvn package --batch-mode --no-transfer-progress -DskipTests
 
-      # Step 10: Capture artifact metadata for downstream use
+      # Step 8: Extract build information
       - name: Extract build information
         id: build-info
         run: |
@@ -94,82 +99,439 @@ jobs:
           echo "artifact-name=${ARTIFACT_ID}" >> $GITHUB_OUTPUT
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
-      # Step 11: Upload build outputs so they can be used in later workflow jobs or downloaded from the Actions UI
+      # Step 9: Display Surefire Test Results in Checks Tab
+      - name: Publish Surefire Test Results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: "📋 Surefire Test Results"
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+          fail-on-error: false
+          max-annotations: 50
+
+      # Step 10: Display JaCoCo Coverage in PR Comments
+      - name: Add JaCoCo Coverage to PR
+        if: github.event_name == 'pull_request'
+        uses: madrapps/jacoco-report@v1.6.1
+        with:
+          paths: target/site/jacoco/jacoco.xml
+          token: ${{ secrets.GITHUB_TOKEN }}
+          min-coverage-overall: 40
+          min-coverage-changed-files: 60
+          title: "📊 JaCoCo Code Coverage Report"
+          update-comment: true
+
+      # Step 11: Setup Pages (Required for deployment)
+      - name: Setup Pages
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/configure-pages@v4
+
+      # Step 12: Create comprehensive test dashboard with proper HTML reports
+      - name: Create Test Dashboard
+        if: always()
+        run: |
+          mkdir -p docs/test-reports
+          
+          # Get current stats
+          if [ -d "target/surefire-reports" ] && [ "$(ls -A target/surefire-reports)" ]; then
+            TEST_COUNT=$(find target/surefire-reports -name "*.xml" -exec grep -c "<testcase" {} + 2>/dev/null | awk '{sum+=$1} END {print sum+0}')
+            FAILURE_COUNT=$(find target/surefire-reports -name "*.xml" -exec grep -o 'failures="[0-9]*"' {} + 2>/dev/null | grep -o '[0-9]*' | awk '{sum+=$1} END {print sum+0}')
+            SUCCESS_COUNT=$((TEST_COUNT - FAILURE_COUNT))
+          else
+            TEST_COUNT=0
+            SUCCESS_COUNT=0
+            FAILURE_COUNT=0
+          fi
+          
+          # Get coverage percentage if available
+          if [ -f "target/site/jacoco/index.html" ]; then
+            COVERAGE=$(grep -o "Total[^%]*%" target/site/jacoco/index.html | tail -1 | grep -o "[0-9]*%" || echo "N/A")
+          else
+            COVERAGE="N/A"
+          fi
+          
+          # Create main dashboard HTML
+          cat > docs/index.html << 'DASHBOARD_EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>Test Reports Dashboard - Build #${{ github.run_number }}</title>
+              <style>
+                  * { margin: 0; padding: 0; box-sizing: border-box; }
+                  body { 
+                      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; 
+                      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                      min-height: 100vh;
+                      padding: 20px;
+                  }
+                  .container { 
+                      max-width: 1200px; 
+                      margin: 0 auto; 
+                      background: white; 
+                      border-radius: 15px; 
+                      box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+                      overflow: hidden;
+                  }
+                  .header { 
+                      background: linear-gradient(135deg, #2c3e50 0%, #3498db 100%); 
+                      color: white; 
+                      padding: 40px 30px; 
+                      text-align: center; 
+                  }
+                  .header h1 { font-size: 2.5em; margin-bottom: 10px; }
+                  .header p { opacity: 0.9; font-size: 1.1em; }
+                  .stats-grid { 
+                      display: grid; 
+                      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
+                      gap: 0; 
+                      background: #f8f9fa; 
+                  }
+                  .stat-card { 
+                      padding: 30px; 
+                      text-align: center; 
+                      border-right: 1px solid #dee2e6; 
+                      background: white;
+                  }
+                  .stat-card:last-child { border-right: none; }
+                  .stat-card .number { 
+                      font-size: 3em; 
+                      font-weight: bold; 
+                      margin-bottom: 10px; 
+                  }
+                  .stat-card .label { 
+                      color: #6c757d; 
+                      font-size: 0.9em; 
+                      text-transform: uppercase; 
+                      letter-spacing: 1px; 
+                  }
+                  .success { color: #28a745; }
+                  .danger { color: #dc3545; }
+                  .info { color: #17a2b8; }
+                  .warning { color: #ffc107; }
+                  
+                  .reports-section { padding: 40px 30px; }
+                  .reports-grid { 
+                      display: grid; 
+                      grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); 
+                      gap: 30px; 
+                      margin-top: 30px; 
+                  }
+                  .report-card { 
+                      border: 1px solid #dee2e6; 
+                      border-radius: 10px; 
+                      overflow: hidden; 
+                      transition: transform 0.3s ease, box-shadow 0.3s ease; 
+                      background: white;
+                  }
+                  .report-card:hover { 
+                      transform: translateY(-5px); 
+                      box-shadow: 0 10px 30px rgba(0,0,0,0.15); 
+                  }
+                  .report-card-header { 
+                      padding: 20px; 
+                      background: #f8f9fa; 
+                      border-bottom: 1px solid #dee2e6; 
+                  }
+                  .report-card-header h3 { 
+                      font-size: 1.3em; 
+                      margin-bottom: 8px; 
+                      display: flex; 
+                      align-items: center; 
+                  }
+                  .report-card-header .emoji { 
+                      font-size: 1.5em; 
+                      margin-right: 10px; 
+                  }
+                  .report-card-body { padding: 20px; }
+                  .btn { 
+                      display: inline-block; 
+                      padding: 12px 30px; 
+                      background: #007bff; 
+                      color: white; 
+                      text-decoration: none; 
+                      border-radius: 25px; 
+                      font-weight: 500; 
+                      transition: all 0.3s ease; 
+                      margin-top: 15px;
+                  }
+                  .btn:hover { 
+                      background: #0056b3; 
+                      transform: translateY(-2px); 
+                  }
+                  .btn.btn-success { background: #28a745; }
+                  .btn.btn-success:hover { background: #1e7e34; }
+                  .btn.btn-info { background: #17a2b8; }
+                  .btn.btn-info:hover { background: #138496; }
+                  
+                  .footer { 
+                      text-align: center; 
+                      padding: 30px; 
+                      background: #f8f9fa; 
+                      color: #6c757d; 
+                      border-top: 1px solid #dee2e6; 
+                  }
+                  
+                  @media (max-width: 768px) {
+                      .stats-grid { grid-template-columns: repeat(2, 1fr); }
+                      .reports-grid { grid-template-columns: 1fr; }
+                      .header h1 { font-size: 2em; }
+                  }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <div class="header">
+                      <h1>🧪 Test Reports Dashboard</h1>
+                      <p>Build #${{ github.run_number }} • $(date -u '+%Y-%m-%d %H:%M:%S UTC') • Commit: $(echo ${{ github.sha }} | cut -c1-8)</p>
+                  </div>
+          
+                  <div class="stats-grid">
+                      <div class="stat-card">
+                          <div class="number success">${SUCCESS_COUNT}</div>
+                          <div class="label">Tests Passed</div>
+                      </div>
+                      <div class="stat-card">
+                          <div class="number danger">${FAILURE_COUNT}</div>
+                          <div class="label">Tests Failed</div>
+                      </div>
+                      <div class="stat-card">
+                          <div class="number info">${TEST_COUNT}</div>
+                          <div class="label">Total Tests</div>
+                      </div>
+                      <div class="stat-card">
+                          <div class="number warning">${COVERAGE}</div>
+                          <div class="label">Code Coverage</div>
+                      </div>
+                  </div>
+          
+                  <div class="reports-section">
+                      <h2>📊 Available Reports</h2>
+                      <div class="reports-grid">
+                          <div class="report-card">
+                              <div class="report-card-header">
+                                  <h3><span class="emoji">📋</span>Surefire Test Reports</h3>
+                              </div>
+                              <div class="report-card-body">
+                                  <p>HTML formatted test reports with detailed execution results, test timings, and failure information.</p>
+                                  <a href="test-reports/surefire-reports/" class="btn">View Surefire Reports</a>
+                              </div>
+                          </div>
+          
+                          <div class="report-card">
+                              <div class="report-card-header">
+                                  <h3><span class="emoji">📊</span>JaCoCo Code Coverage</h3>
+                              </div>
+                              <div class="report-card-body">
+                                  <p>Comprehensive code coverage analysis with line, branch, and method coverage metrics.</p>
+                                  <a href="test-reports/jacoco/" class="btn btn-info">View Coverage Report</a>
+                              </div>
+                          </div>
+          
+                          <div class="report-card">
+                              <div class="report-card-header">
+                                  <h3><span class="emoji">✨</span>Allure Test Reports</h3>
+                              </div>
+                              <div class="report-card-body">
+                                  <p>Beautiful interactive test execution reports with detailed insights, trends, and attachments.</p>
+                                  <a href="test-reports/allure-report/" class="btn btn-success">View Allure Report</a>
+                              </div>
+                          </div>
+                      </div>
+                  </div>
+          
+                  <div class="footer">
+                      <p>🚀 Generated by GitHub Actions CI/CD Pipeline</p>
+                      <p>Reports are automatically updated with each build</p>
+                  </div>
+              </div>
+          </body>
+          </html>
+          DASHBOARD_EOF
+          
+          # Copy HTML Surefire reports (generated by surefire-report:report-only)
+          if [ -d "target/site" ] && [ -f "target/site/surefire-report.html" ]; then
+            mkdir -p docs/test-reports/surefire-reports
+            cp target/site/surefire-report.html docs/test-reports/surefire-reports/index.html
+            echo "✅ Copied Surefire HTML report as index.html"
+            
+            # Also copy CSS and resources if they exist
+            if [ -d "target/site/css" ]; then
+              cp -r target/site/css docs/test-reports/surefire-reports/
+            fi
+            if [ -d "target/site/images" ]; then
+              cp -r target/site/images docs/test-reports/surefire-reports/
+            fi
+            if [ -d "target/site/js" ]; then
+              cp -r target/site/js docs/test-reports/surefire-reports/
+            fi
+          else
+            # Fallback: Create a simple HTML index for XML reports
+            mkdir -p docs/test-reports/surefire-reports
+            
+            # Create the fallback HTML file
+            cat > docs/test-reports/surefire-reports/index.html << 'SUREFIRE_EOF'
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Surefire Test Reports</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; }
+                    h1 { color: #333; }
+                    .test-file { 
+                        background: #f5f5f5; 
+                        padding: 10px; 
+                        margin: 10px 0; 
+                        border-radius: 5px; 
+                    }
+                    .test-file a { 
+                        color: #007bff; 
+                        text-decoration: none; 
+                        font-weight: bold;
+                    }
+                    .test-file a:hover { text-decoration: underline; }
+                </style>
+            </head>
+            <body>
+                <h1>📋 Surefire Test Reports</h1>
+                <p>Individual test result files:</p>
+          SUREFIRE_EOF
+            
+            if [ -d "target/surefire-reports" ]; then
+              # Copy XML files and create links
+              cp target/surefire-reports/*.xml docs/test-reports/surefire-reports/ 2>/dev/null || true
+              cp target/surefire-reports/*.txt docs/test-reports/surefire-reports/ 2>/dev/null || true
+              
+              # Add links to XML files
+              for file in target/surefire-reports/TEST-*.xml; do
+                if [ -f "$file" ]; then
+                  filename=$(basename "$file")
+                  classname=$(echo "$filename" | sed 's/TEST-\(.*\)\.xml/\1/')
+                  echo "                <div class=\"test-file\">" >> docs/test-reports/surefire-reports/index.html
+                  echo "                    <a href=\"$filename\">$classname</a>" >> docs/test-reports/surefire-reports/index.html
+                  echo "                    <div style=\"font-size: 0.9em; color: #666; margin-top: 5px;\">XML test results for $classname</div>" >> docs/test-reports/surefire-reports/index.html
+                  echo "                </div>" >> docs/test-reports/surefire-reports/index.html
+                fi
+              done
+            fi
+            
+            cat >> docs/test-reports/surefire-reports/index.html << 'SUREFIRE_END_EOF'
+                <div style="margin-top: 30px; padding: 20px; background: #e7f3ff; border-radius: 5px;">
+                    <strong>Note:</strong> These are raw XML test result files. For better formatted reports, 
+                    consider adding the Maven Surefire Report Plugin to generate HTML reports.
+                </div>
+            </body>
+            </html>
+          SUREFIRE_END_EOF
+            echo "✅ Created fallback HTML index for XML reports"
+          fi
+          
+          # Copy JaCoCo reports
+          if [ -d "target/site/jacoco" ]; then
+            cp -r target/site/jacoco docs/test-reports/
+            echo "✅ Copied JaCoCo reports"
+          fi
+          
+          # Copy Allure reports
+          if [ -d "target/allure-report" ]; then
+            cp -r target/allure-report docs/test-reports/
+            echo "✅ Copied Allure reports"
+          fi
+          
+          echo "📁 Dashboard structure:"
+          find docs -type f -name "*.html" | head -10
+
+      # Step 13: Upload Pages artifact
+      - name: Upload Pages artifact
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./docs
+
+      # Step 14: Deploy to GitHub Pages
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      # Step 15: Create Step Summary with corrected links
+      - name: Generate Live Test Reports Summary
+        if: always()
+        run: |
+          echo "## 🧪 Live Test Reports Dashboard" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ github.ref }}" == "refs/heads/main" ] && [ "${{ github.event_name }}" == "push" ]; then
+            PAGES_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+            echo "### 🌐 Live Dashboard" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "📊 **[View Complete Test Dashboard](${PAGES_URL})** - All reports in one place" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🔗 Direct Report Links" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Report Type | Live Link | Description |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------------|-----------|-------------|" >> $GITHUB_STEP_SUMMARY
+            echo "| **Surefire** | [📋 View Report](${PAGES_URL}/test-reports/surefire-reports/) | JUnit XML test results |" >> $GITHUB_STEP_SUMMARY
+            echo "| **JaCoCo** | [📊 View Coverage](${PAGES_URL}/test-reports/jacoco/) | Code coverage analysis |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Allure** | [✨ View Report](${PAGES_URL}/test-reports/allure-report/) | Interactive test report |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🔗 **Pages URL**: ${PAGES_URL}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### 📋 Test Results Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Reports are available in the **Checks** tab above." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "_Live dashboard is only deployed from main branch pushes._" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Test Execution Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -d "target/surefire-reports" ] && [ "$(ls -A target/surefire-reports)" ]; then
+            TEST_COUNT=$(find target/surefire-reports -name "*.xml" -exec grep -c "<testcase" {} + 2>/dev/null | awk '{sum+=$1} END {print sum+0}')
+            FAILURE_COUNT=$(find target/surefire-reports -name "*.xml" -exec grep -o 'failures="[0-9]*"' {} + 2>/dev/null | grep -o '[0-9]*' | awk '{sum+=$1} END {print sum+0}')
+            SUCCESS_COUNT=$((TEST_COUNT - FAILURE_COUNT))
+            
+            echo "- ✅ **Tests Passed**: ${SUCCESS_COUNT}" >> $GITHUB_STEP_SUMMARY
+            echo "- ❌ **Tests Failed**: ${FAILURE_COUNT}" >> $GITHUB_STEP_SUMMARY
+            echo "- 📊 **Total Tests**: ${TEST_COUNT}" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -f "target/site/jacoco/index.html" ]; then
+            echo "- 📈 **Coverage Report**: Available" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # Step 16: Upload artifacts as fallback
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: application-jar-${{ github.run_number }}
           path: target/*.jar
           retention-days: 7
-          compression-level: 6
 
-      # Step 12: Upload test result files so they are viewable in the Actions UI for debugging and reporting
-      - name: Upload test reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-reports-${{ github.run_number }}
-          path: target/surefire-reports/**/*.xml
-          retention-days: 7
-          if-no-files-found: warn
-
-      # Step 13: Detect if test reports exist for publishing
-      - name: Check for test reports
-        id: check-reports
-        run: |
-          if find target/surefire-reports -name "*.xml" | grep -q .; then
-            echo "reports-exist=true" >> $GITHUB_OUTPUT
-          else
-            echo "reports-exist=false" >> $GITHUB_OUTPUT
-          fi
-
-      # Step 14: Publish JUnit results to GitHub UI
-      - name: Publish test results
-        uses: dorny/test-reporter@v1
-        if: steps.check-reports.outputs.reports-exist == 'true'
-        with:
-          name: Test Results
-          path: target/surefire-reports/*.xml
-          reporter: java-junit
-          fail-on-error: false
-          max-annotations: 10
-
-      # Step 15: Summarize build outcome in GitHub UI
-      - name: Build Summary
-        if: always()
-        run: |
-          echo "## 🚀 Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "| Component | Status | Details |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|--------|---------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Java Version** | ✅ | ${{ env.JAVA_VERSION }} (Temurin) |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Build Number** | ✅ | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Commit SHA** | ✅ | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          
-          if JAR_FILE=$(ls target/*.jar 2>/dev/null | head -1); then
-            JAR_NAME=$(basename "$JAR_FILE")
-            JAR_SIZE=$(stat -c%s "$JAR_FILE")
-            echo "| **Build Artifact** | ✅ | \`${JAR_NAME}\` ($(numfmt --to=iec $JAR_SIZE)) |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| **Build Artifact** | ❌ | No JAR file found |" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          if [ "${{ steps.check-reports.outputs.reports-exist }}" == "true" ]; then
-            TEST_COUNT=$(grep -c "<testcase" target/surefire-reports/*.xml | awk -F: '{sum+=$2} END {print sum}')
-            FAILURE_COUNT=$(grep -o 'failures="[1-9][0-9]*"' target/surefire-reports/*.xml | wc -l)
-            if [ "$FAILURE_COUNT" -eq 0 ]; then
-              echo "| **Tests** | ✅ | ${TEST_COUNT} passed |" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "| **Tests** | ⚠️ | ${TEST_COUNT} total, ${FAILURE_COUNT} failed |" >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "| **Tests** | ⚠️ | No reports found |" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          echo "- **Application JAR**: \`application-jar-${{ github.run_number }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Test Reports**: \`test-reports-${{ github.run_number }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "_Build completed at $(date -u '+%Y-%m-%d %H:%M:%S UTC')_" >> $GITHUB_STEP_SUMMARY
-
-      # Step 16: Cleanup Maven cache on build failure
+      # Step 17: Cleanup on failure
       - name: Cleanup on failure
         if: failure()
         run: rm -rf ~/.m2/repository/com ~/.m2/repository/org || true
+
+  # Separate job for Pages deployment to avoid permission issues
+  deploy-pages:
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    
+    permissions:
+      pages: write
+      id-token: write
+      
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+      
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
