@@ -21,14 +21,17 @@ permissions:
   checks: write
   pull-requests: write
   actions: read
+  pages: write
+  id-token: write
 
 # Global environment variables for consistent configuration
 env:
   JAVA_VERSION: '21'
   JAVA_DISTRIBUTION: 'temurin'
-  MAVEN_OPTS: '-Xmx2048m -XX:+UseG1GC -XX:MaxMetaspaceSize=512m'
+  MAVEN_OPTS: '-Xmx2048m -XX:+UseG1GC -XX:MaxMetaspaceSize=512m -Dmaven.artifact.threads=1C'
   MIN_COVERAGE_OVERALL: 40
   MIN_COVERAGE_CHANGED_FILES: 60
+  CACHE_VERSION: v2
 
 # Concurrency control to prevent resource conflicts
 concurrency:
@@ -37,81 +40,214 @@ concurrency:
 
 jobs:
   # =================================================================
-  # Main Build, Test, and Quality Analysis Job
+  # STAGE 1: Source Code Preparation & Environment Setup
   # =================================================================
-  build-and-test:
-    name: 🔨 Build & Test
+  checkout-and-setup:
+    name: 📥 Checkout & Setup
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
+    timeout-minutes: 8
+    
     outputs:
-      artifact-name: ${{ steps.build-info.outputs.artifact-name }}
-      version: ${{ steps.build-info.outputs.version }}
-      reports-ready: ${{ steps.check-reports.outputs.reports-exist }}
-
+      java-version: ${{ env.JAVA_VERSION }}
+      cache-hit: ${{ steps.cache-deps.outputs.cache-hit }}
+      pom-hash: ${{ steps.cache-keys.outputs.pom-hash }}
+      
     steps:
-      # Step 1: Checkout repository with full history for better analysis
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Step 2: Set up Java Development Kit with built-in Maven caching
-      - name: ☕ Setup JDK ${{ env.JAVA_VERSION }}
+      - name: 🔑 Generate Cache Keys
+        id: cache-keys
+        run: |
+          POM_HASH=$(find . -name "pom.xml" -exec sha256sum {} \; | sha256sum | cut -d' ' -f1)
+          echo "pom-hash=${POM_HASH}" >> $GITHUB_OUTPUT
+          echo "📋 Generated POM hash: ${POM_HASH}"
+
+      - name: ☕ Setup JDK with Enhanced Caching
         uses: actions/setup-java@v4
         with:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: ${{ env.JAVA_DISTRIBUTION }}
           cache: maven
 
-      # Step 3: Enhanced Maven dependency caching with correct paths
-      - name: 🗄️ Cache Maven Dependencies
+      - name: 🗄️ Cache Maven Dependencies (Fixed)
+        id: cache-deps
         uses: actions/cache@v4
         with:
           path: |
             ~/.m2/repository
-            !~/.m2/repository/com/Ledger
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml', '.mvn/wrapper/maven-wrapper.properties') }}
+            target/dependency-cache
+          key: ${{ env.CACHE_VERSION }}-${{ runner.os }}-maven-${{ steps.cache-keys.outputs.pom-hash }}
           restore-keys: |
-            ${{ runner.os }}-maven-
-            ${{ runner.os }}-
+            ${{ env.CACHE_VERSION }}-${{ runner.os }}-maven-
+            v1-${{ runner.os }}-maven-
 
-      # Step 4: Download and validate all dependencies
-      - name: 📦 Download Dependencies
+      - name: 📦 Resolve Dependencies (Parallel)
+        if: steps.cache-deps.outputs.cache-hit != 'true'
         run: |
-          echo "🔍 Resolving Maven dependencies..."
-          mvn dependency:resolve dependency:resolve-sources --batch-mode --no-transfer-progress --quiet
-          echo "✅ Dependencies resolved successfully"
+          echo "🔍 Resolving Maven dependencies in parallel..."
+          mkdir -p target/dependency-cache
+          
+          # Resolve all dependencies in parallel
+          mvn dependency:resolve dependency:sources dependency:resolve-plugins \
+            --batch-mode --no-transfer-progress --quiet -T 2C \
+            -Dmaven.resolver.transport=wagon
+          
+          # Cache dependency tree for faster subsequent builds
+          mvn dependency:tree --batch-mode --no-transfer-progress --quiet > target/dependency-cache/dep-tree.txt
+          
+          echo "✅ All dependencies resolved successfully"
 
-      # Step 5: Validate project structure and compile source code
-      - name: 🔍 Validate & Compile
+      - name: 🔍 Validate Project Structure
         run: |
           echo "🔍 Validating project structure..."
           mvn validate --batch-mode --no-transfer-progress --quiet
-          
-          echo "🔨 Compiling main sources..."
-          mvn compile --batch-mode --no-transfer-progress --quiet
-          
-          echo "🔨 Compiling test sources..."
-          mvn test-compile --batch-mode --no-transfer-progress --quiet
-          
-          echo "✅ Validation and compilation completed successfully"
+          echo "✅ Project validation completed"
 
-      # Step 6: Execute comprehensive testing suite with coverage analysis
-      - name: 🧪 Run Tests with Coverage Analysis
+  # =================================================================
+  # STAGE 2: Build & Compilation
+  # =================================================================
+  build:
+    name: 🔨 Build & Compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    needs: checkout-and-setup
+    
+    outputs:
+      artifact-name: ${{ steps.build-info.outputs.artifact-name }}
+      version: ${{ steps.build-info.outputs.version }}
+      group-id: ${{ steps.build-info.outputs.group-id }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: ☕ Setup JDK with Cache
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ needs.checkout-and-setup.outputs.java-version }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: 🗄️ Restore Maven Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            target/dependency-cache
+          key: ${{ env.CACHE_VERSION }}-${{ runner.os }}-maven-${{ needs.checkout-and-setup.outputs.pom-hash }}
+          restore-keys: |
+            ${{ env.CACHE_VERSION }}-${{ runner.os }}-maven-
+            v1-${{ runner.os }}-maven-
+
+      - name: 🔨 Compile Sources (Parallel)
+        run: |
+          echo "🔨 Compiling sources in parallel..."
+          mvn compile test-compile --batch-mode --no-transfer-progress --quiet -T 2C \
+            -Dmaven.compiler.useIncrementalCompilation=true
+          echo "✅ Compilation completed successfully"
+
+      - name: 📋 Extract Build Information
+        id: build-info
+        run: |
+          echo "📋 Extracting project metadata..."
+          
+          ARTIFACT_ID=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout --batch-mode)
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout --batch-mode)  
+          GROUP_ID=$(mvn help:evaluate -Dexpression=project.groupId -q -DforceStdout --batch-mode)
+          
+          if [[ -z "$ARTIFACT_ID" || -z "$VERSION" || "$ARTIFACT_ID" == *"WARNING"* || "$VERSION" == *"WARNING"* ]]; then
+            echo "❌ ERROR: Failed to extract clean project information"
+            exit 1
+          fi
+          
+          echo "✅ Project Information:"
+          echo "  📦 Group ID: $GROUP_ID"
+          echo "  🏷️ Artifact ID: $ARTIFACT_ID" 
+          echo "  🔖 Version: $VERSION"
+          
+          echo "artifact-name=${ARTIFACT_ID}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "group-id=${GROUP_ID}" >> $GITHUB_OUTPUT
+
+      - name: 💾 Cache Compiled Classes
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/classes/
+            target/test-classes/
+            target/maven-status/
+          key: ${{ env.CACHE_VERSION }}-${{ runner.os }}-compiled-${{ github.sha }}-${{ needs.checkout-and-setup.outputs.pom-hash }}
+
+      - name: 📤 Upload Compiled Classes
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-classes-${{ github.run_number }}
+          path: |
+            target/classes/
+            target/test-classes/
+            pom.xml
+          retention-days: 1
+
+  # =================================================================
+  # STAGE 3: Testing & Quality Analysis (FIXED)
+  # =================================================================
+  test:
+    name: 🧪 Test & Quality Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    needs: [checkout-and-setup, build]
+    
+    outputs:
+      reports-ready: ${{ steps.check-reports.outputs.reports-exist }}
+      coverage-percentage: ${{ steps.coverage-info.outputs.coverage }}
+      test-count: ${{ steps.test-count.outputs.test-count }}
+      
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: ☕ Setup JDK with Cache
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ needs.checkout-and-setup.outputs.java-version }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: 🗄️ Restore Maven Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            target/dependency-cache
+          key: ${{ env.CACHE_VERSION }}-${{ runner.os }}-maven-${{ needs.checkout-and-setup.outputs.pom-hash }}
+
+      - name: 💾 Restore Compiled Classes
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/classes/
+            target/test-classes/
+            target/maven-status/
+          key: ${{ env.CACHE_VERSION }}-${{ runner.os }}-compiled-${{ github.sha }}-${{ needs.checkout-and-setup.outputs.pom-hash }}
+
+      - name: 🧪 Run Tests with Coverage Analysis (FIXED)
         run: |
           echo "🧪 Starting comprehensive test execution..."
-          
           mvn clean test jacoco:report --batch-mode --no-transfer-progress -T 1C \
             -Dmaven.test.failure.ignore=false \
             -Dspring.profiles.active=test
-          
           echo "✅ Test execution and coverage analysis completed successfully"
         env:
           MAVEN_OPTS: ${{ env.MAVEN_OPTS }}
 
-      # Step 7: Generate Allure Interactive Reports (FIRST)
       - name: 📈 Generate Allure Interactive Reports
         run: |
           echo "🎯 Checking for Allure plugin configuration..."
@@ -119,57 +255,239 @@ jobs:
             echo "📈 Generating Allure interactive reports..."
             mvn allure:report --batch-mode --no-transfer-progress --quiet
             echo "✅ Allure reports generated successfully"
+            if [ -d "target/allure-report" ]; then
+              echo "✅ Allure report directory exists"
+              ls -la target/allure-report/
+            else
+              echo "⚠️ Allure report directory not found"
+            fi
           else
             echo "ℹ️ Allure plugin not configured - skipping interactive reports"
           fi
 
-      # Step 8: Ensure JaCoCo Coverage Reports (SECOND)
-      - name: 📊 Generate JaCoCo Coverage Reports
-        run: |
-          echo "📊 Generating JaCoCo coverage reports..."
-          
-          mvn jacoco:report --batch-mode --no-transfer-progress --quiet
-          
-          if [ -f "target/site/jacoco/index.html" ]; then
-            echo "✅ JaCoCo coverage reports generated successfully"
-            
-            COVERAGE=$(grep -o "Total[^%]*[0-9]\+%" target/site/jacoco/index.html 2>/dev/null | tail -1 | grep -o "[0-9]\+%" || echo "N/A")
-            if [ "$COVERAGE" != "N/A" ] && [ -n "$COVERAGE" ]; then
-              echo "🎯 Overall Code Coverage: ${COVERAGE}"
-            fi
-          else
-            echo "⚠️ JaCoCo coverage report not found"
-          fi
-
-      # Step 9: Generate Surefire Test Reports (THIRD)
       - name: 🧪 Generate Surefire Test Reports
         run: |
           echo "📊 Generating Surefire test reports..."
-          
-          # Generate the site reports which includes surefire-report
-          mvn site -DgenerateReports=true --batch-mode --no-transfer-progress --quiet
-          
-          # Also run report-only as backup
           mvn surefire-report:report-only --batch-mode --no-transfer-progress --quiet
           
           if [ -f "target/site/surefire-report.html" ]; then
             echo "✅ Surefire HTML reports generated successfully"
+            ls -la target/site/
           else
-            echo "⚠️ Surefire HTML report not found"
-            # List what files were actually generated for debugging
-            echo "Files in target/site/:"
-            ls -la target/site/ 2>/dev/null || echo "No target/site directory found"
-            echo "Files in target/surefire-reports/:"
-            ls -la target/surefire-reports/ 2>/dev/null || echo "No target/surefire-reports directory found"
+            echo "⚠️ Surefire HTML report not found - generating site reports..."
+            mvn site -DgenerateReports=true --batch-mode --no-transfer-progress --quiet
+            if [ -f "target/site/surefire-report.html" ]; then
+              echo "✅ Surefire HTML reports generated via site goal"
+            else
+              echo "ℹ️ Surefire HTML report not available"
+              echo "Files in target/site/:"
+              ls -la target/site/ 2>/dev/null || echo "No target/site directory found"
+              echo "Files in target/surefire-reports/:"
+              ls -la target/surefire-reports/ 2>/dev/null || echo "No target/surefire-reports directory found"
+            fi
           fi
-          
           echo "✅ Test report generation completed successfully"
 
-      # Step 10: Build application packages and artifacts
-      - name: 📦 Build Application Package
+      - name: 📊 Generate JaCoCo Coverage Reports (FIXED)
+        id: coverage-info
+        run: |
+          echo "📊 Verifying JaCoCo coverage data and generating reports..."
+          
+          # Check if jacoco.exec exists and has data
+          if [ -f "target/jacoco.exec" ]; then
+            EXEC_SIZE=$(stat -c%s "target/jacoco.exec" 2>/dev/null || echo "0")
+            echo "📋 JaCoCo execution data file size: ${EXEC_SIZE} bytes"
+            
+            if [ "$EXEC_SIZE" -gt "0" ]; then
+              echo "✅ JaCoCo execution data found, generating coverage reports..."
+              mvn jacoco:report --batch-mode --no-transfer-progress --quiet
+              
+              if [ -f "target/site/jacoco/index.html" ]; then
+                echo "✅ JaCoCo coverage reports generated successfully"
+                
+                # Enhanced coverage extraction with multiple fallback methods
+                COVERAGE="0%"
+                
+                # Method 1: Try to extract from HTML
+                if [ -f "target/site/jacoco/index.html" ]; then
+                  COVERAGE=$(grep -oP 'Total[^<]*?(\d+)%' target/site/jacoco/index.html 2>/dev/null | tail -1 | grep -oP '\d+%' || echo "")
+                fi
+                
+                # Method 2: Try alternative HTML parsing
+                if [ -z "$COVERAGE" ] || [ "$COVERAGE" = "" ]; then
+                  COVERAGE=$(grep -o "Total.*[0-9]\+%" target/site/jacoco/index.html 2>/dev/null | sed 's/.*\([0-9]\+%\).*/\1/' | tail -1 || echo "")
+                fi
+                
+                # Method 3: Check CSV report if available
+                if [ -z "$COVERAGE" ] || [ "$COVERAGE" = "" ]; then
+                  mvn jacoco:report -Dformat=csv --batch-mode --no-transfer-progress --quiet 2>/dev/null || true
+                  if [ -f "target/site/jacoco/jacoco.csv" ]; then
+                    # Extract coverage from CSV (instruction coverage)
+                    TOTAL_MISSED=$(tail -1 target/site/jacoco/jacoco.csv | cut -d',' -f4)
+                    TOTAL_COVERED=$(tail -1 target/site/jacoco/jacoco.csv | cut -d',' -f5)
+                    if [ -n "$TOTAL_MISSED" ] && [ -n "$TOTAL_COVERED" ] && [ "$TOTAL_MISSED" != "INSTRUCTION_MISSED" ]; then
+                      TOTAL=$((TOTAL_MISSED + TOTAL_COVERED))
+                      if [ "$TOTAL" -gt "0" ]; then
+                        COVERAGE_NUM=$((TOTAL_COVERED * 100 / TOTAL))
+                        COVERAGE="${COVERAGE_NUM}%"
+                      fi
+                    fi
+                  fi
+                fi
+                
+                # Fallback: Set to 0% if still empty
+                if [ -z "$COVERAGE" ] || [ "$COVERAGE" = "" ]; then
+                  COVERAGE="0%"
+                fi
+                
+                echo "🎯 Overall Code Coverage: ${COVERAGE}"
+                echo "coverage=${COVERAGE}" >> $GITHUB_OUTPUT
+                
+                # Debug information
+                echo "📋 Coverage report files:"
+                ls -la target/site/jacoco/ 2>/dev/null || echo "No jacoco directory found"
+              else
+                echo "⚠️ JaCoCo HTML report not generated despite execution data"
+                echo "coverage=0%" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "⚠️ JaCoCo execution data file is empty - no tests were executed or instrumented"
+              echo "coverage=0%" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "⚠️ JaCoCo execution data file not found - coverage instrumentation may not be configured"
+            echo "coverage=0%" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🔢 Count Test Suites
+        id: test-count
+        run: |
+          echo "🔢 Counting test suites..."
+          if [ -d "target/surefire-reports" ] && [ "$(ls -A target/surefire-reports 2>/dev/null)" ]; then
+            TEST_COUNT=$(ls target/surefire-reports/*.xml 2>/dev/null | wc -l)
+            echo "✅ Found $TEST_COUNT test suites"
+            echo "test-count=${TEST_COUNT}" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ No test reports found"
+            echo "test-count=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 🔍 Validate All Reports
+        id: check-reports
+        run: |
+          echo "🔍 Validating all generated reports..."
+          
+          REPORTS_EXIST=false
+          
+          # Check Surefire reports
+          if [ -d "target/surefire-reports" ] && [ "$(ls -A target/surefire-reports/*.xml 2>/dev/null)" ]; then
+            echo "✅ Surefire XML reports found"
+            REPORTS_EXIST=true
+          else
+            echo "⚠️ Surefire XML reports missing"
+          fi
+          
+          # Check JaCoCo reports
+          if [ -f "target/site/jacoco/index.html" ]; then
+            echo "✅ JaCoCo coverage reports found"
+          else
+            echo "⚠️ JaCoCo coverage reports missing"
+          fi
+          
+          # Check Allure reports
+          if [ -d "target/allure-report" ] && [ -f "target/allure-report/index.html" ]; then
+            echo "✅ Allure interactive reports found"
+          else
+            echo "ℹ️ Allure reports not generated (plugin may not be configured)"
+          fi
+          
+          # Check Surefire HTML reports
+          if [ -f "target/site/surefire-report.html" ]; then
+            echo "✅ Surefire HTML reports found"
+          else
+            echo "⚠️ Surefire HTML reports missing"
+          fi
+          
+          echo "reports-exist=${REPORTS_EXIST}" >> $GITHUB_OUTPUT
+
+      - name: 💾 Cache Test Reports
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/site/
+            target/surefire-reports/
+            target/allure-report/
+            target/jacoco.exec
+          key: ${{ env.CACHE_VERSION }}-${{ runner.os }}-reports-${{ github.sha }}-${{ github.run_number }}
+
+      - name: 📋 Publish Test Results
+        uses: dorny/test-reporter@v1
+        if: always() && steps.check-reports.outputs.reports-exist == 'true'
+        with:
+          name: "📋 Surefire Test Reports"
+          path: "target/surefire-reports/*.xml"
+          reporter: java-junit
+          fail-on-error: false
+          max-annotations: 50
+          only-summary: false
+
+      - name: 📤 Upload Test Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports-${{ github.run_number }}
+          path: |
+            target/site/
+            target/surefire-reports/
+            target/allure-report/
+            target/jacoco.exec
+          retention-days: 7
+          if-no-files-found: warn
+
+  # =================================================================
+  # STAGE 4: Package & Artifact Creation
+  # =================================================================
+  package:
+    name: 📦 Package & Artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    needs: [checkout-and-setup, build, test]
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: ☕ Setup JDK with Cache
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ needs.checkout-and-setup.outputs.java-version }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+
+      - name: 🗄️ Restore Maven Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            target/dependency-cache
+          key: ${{ env.CACHE_VERSION }}-${{ runner.os }}-maven-${{ needs.checkout-and-setup.outputs.pom-hash }}
+
+      - name: 💾 Restore Compiled Classes
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/classes/
+            target/test-classes/
+            target/maven-status/
+          key: ${{ env.CACHE_VERSION }}-${{ runner.os }}-compiled-${{ github.sha }}-${{ needs.checkout-and-setup.outputs.pom-hash }}
+
+      - name: 📦 Build Application Package (Optimized)
         run: |
           echo "📦 Building application package..."
-          mvn package --batch-mode --no-transfer-progress --quiet -DskipTests
+          mvn package --batch-mode --no-transfer-progress --quiet -T 1C \
+            -DskipTests -Djacoco.skip=true \
+            -Dmaven.javadoc.skip=true \
+            -Dmaven.source.skip=true
           
           if ls target/*.jar 1> /dev/null 2>&1; then
             echo "✅ Application JAR built successfully:"
@@ -185,86 +503,63 @@ jobs:
             exit 1
           fi
 
-      # Step 11: Extract build metadata and project information
-      - name: 📋 Extract Build Information
-        id: build-info
-        run: |
-          echo "📋 Extracting project metadata..."
-          
-          ARTIFACT_ID=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout 2>/dev/null | tail -1)
-          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout 2>/dev/null | tail -1)
-          GROUP_ID=$(mvn help:evaluate -Dexpression=project.groupId -q -DforceStdout 2>/dev/null | tail -1)
-          
-          if [[ -z "$ARTIFACT_ID" || -z "$VERSION" || "$ARTIFACT_ID" == *"WARNING"* || "$VERSION" == *"WARNING"* ]]; then
-            echo "❌ ERROR: Failed to extract clean project information from pom.xml"
-            echo "Artifact ID: '$ARTIFACT_ID'"
-            echo "Version: '$VERSION'"
-            exit 1
-          fi
-          
-          echo "✅ Project Information Successfully Extracted:"
-          echo "  📦 Group ID: $GROUP_ID"
-          echo "  🏷️ Artifact ID: $ARTIFACT_ID" 
-          echo "  🔖 Version: $VERSION"
-          
-          echo "artifact-name=${ARTIFACT_ID}" >> $GITHUB_OUTPUT
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "group-id=${GROUP_ID}" >> $GITHUB_OUTPUT
-
-      # Step 12: Check if test reports exist for summary generation
-      - name: 🔍 Check Test Reports
-        id: check-reports
-        run: |
-          echo "🔍 Checking for test report availability..."
-          
-          if [ -d "target/surefire-reports" ] && [ "$(ls -A target/surefire-reports 2>/dev/null)" ]; then
-            echo "reports-exist=true" >> $GITHUB_OUTPUT
-            echo "✅ Surefire test reports found"
-            
-            REPORT_COUNT=$(ls target/surefire-reports/*.xml 2>/dev/null | wc -l)
-            echo "📊 Found $REPORT_COUNT test report files"
-          else
-            echo "reports-exist=false" >> $GITHUB_OUTPUT
-            echo "⚠️ No test reports found in target/surefire-reports"
-          fi
-
-      # Step 13: Publish comprehensive test results to GitHub Checks
-      - name: 📋 Publish Test Results to Checks
-        uses: dorny/test-reporter@v1
-        if: always() && steps.check-reports.outputs.reports-exist == 'true'
+      - name: 📤 Upload Application Artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: "🧪 Unit Test Results"
-          path: "target/surefire-reports/*.xml"
-          reporter: java-junit
-          fail-on-error: false
-          max-annotations: 50
-          only-summary: false
+          name: ${{ needs.build.outputs.artifact-name }}-${{ needs.build.outputs.version }}-${{ github.run_number }}
+          path: |
+            target/*.jar
+            !target/*-sources.jar
+            !target/*-javadoc.jar
+          retention-days: 30
 
-      # Step 14: Add detailed coverage report to pull request comments
-      - name: 💬 Add Coverage Report to PR
-        if: github.event_name == 'pull_request' && hashFiles('target/site/jacoco/jacoco.xml') != ''
-        uses: madrapps/jacoco-report@v1.6.1
+  # =================================================================
+  # STAGE 5: Deployment Preparation & Pages Setup
+  # =================================================================
+  prepare-deployment:
+    name: 🚀 Prepare Deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    needs: [build, test, package]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 💾 Restore Cached Reports
+        uses: actions/cache@v4
         with:
-          paths: target/site/jacoco/jacoco.xml
-          token: ${{ secrets.GITHUB_TOKEN }}
-          min-coverage-overall: ${{ env.MIN_COVERAGE_OVERALL }}
-          min-coverage-changed-files: ${{ env.MIN_COVERAGE_CHANGED_FILES }}
-          title: "📊 JaCoCo Code Coverage Report"
-          update-comment: true
-          pass-emoji: '✅'
-          fail-emoji: '❌'
+          path: |
+            target/site/
+            target/surefire-reports/
+            target/allure-report/
+            target/jacoco.exec
+          key: ${{ env.CACHE_VERSION }}-${{ runner.os }}-reports-${{ github.sha }}-${{ github.run_number }}
 
-      # Step 15: Prepare reports for GitHub Pages deployment
-      - name: 📁 Prepare Reports for Pages
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      - name: 📥 Download Test Reports (Fallback)
+        if: failure()
+        uses: actions/download-artifact@v4
+        with:
+          name: test-reports-${{ github.run_number }}
+          path: ./target/
+
+      - name: 📁 Prepare Reports for Pages (Optimized)
         run: |
           echo "📁 Preparing reports for GitHub Pages deployment..."
-          
           mkdir -p docs/reports
           
           # Capture current UTC date
           CURRENT_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
-          
+          TEST_COUNT="${{ needs.test.outputs.test-count }}"
+          COVERAGE="${{ needs.test.outputs.coverage-percentage }}"
+          ARTIFACT_NAME="${{ needs.build.outputs.artifact-name }}"
+          VERSION="${{ needs.build.outputs.version }}"
+
+          # Ensure TEST_COUNT and COVERAGE have fallback values
+          TEST_COUNT=${TEST_COUNT:-0}
+          COVERAGE=${COVERAGE:-0%}
+
           cat > docs/index.html << EOF
           <!DOCTYPE html>
           <html lang="en">
@@ -279,10 +574,18 @@ jobs:
               .report-list a { text-decoration: none; color: #0366d6; font-weight: 500; }
               .report-list a:hover { text-decoration: underline; }
               .description { color: #586069; margin-top: 0.5rem; }
+              .summary { background: #f6f8fa; padding: 1rem; border-radius: 8px; margin-bottom: 2rem; }
             </style>
           </head>
           <body>
             <h1>📊 Project Quality Reports</h1>
+            <div class="summary">
+              <h2>Build Summary</h2>
+              <p><strong>Artifact:</strong> ${ARTIFACT_NAME}-${VERSION}</p>
+              <p><strong>Test Suites Executed:</strong> ${TEST_COUNT}</p>
+              <p><strong>Overall Coverage:</strong> ${COVERAGE}</p>
+              <p><strong>Generated:</strong> Build #${{ github.run_number }} • ${CURRENT_DATE}</p>
+            </div>
             <ul class="report-list">
               <li>
                 <a href="reports/allure-report/index.html">✨ Interactive Test Report (Allure)</a>
@@ -303,259 +606,103 @@ jobs:
           </body>
           </html>
           EOF
+
+          # Replace placeholders efficiently
+          sed -i "s/ARTIFACT_NAME_PLACEHOLDER/${ARTIFACT_NAME}/g" docs/index.html
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" docs/index.html
+          sed -i "s/TEST_COUNT_PLACEHOLDER/${TEST_COUNT}/g" docs/index.html
+          sed -i "s/COVERAGE_PLACEHOLDER/${COVERAGE}/g" docs/index.html
+          sed -i "s/BUILD_NUMBER_PLACEHOLDER/${{ github.run_number }}/g" docs/index.html
+          sed -i "s/DEPLOY_TIME_PLACEHOLDER/${CURRENT_DATE}/g" docs/index.html
           
-          echo "📋 Copying available reports..."
+          echo "📋 Copying available reports efficiently..."
           
-          # First: Allure reports
-          if [ -d "target/allure-report" ]; then
-            cp -r target/allure-report docs/reports/
-            echo "✅ Allure interactive reports copied"
-          else
-            echo "ℹ️ Allure reports not available"
-            mkdir -p docs/reports/allure-report
-            echo "<html><body><h1>Allure Reports Unavailable</h1><p>Allure plugin not configured in pom.xml.</p></body></html>" > docs/reports/allure-report/index.html
-          fi
+          # Copy reports with error handling
+          copy_report() {
+            local src=$1
+            local dest=$2
+            local name=$3
+            
+            if [ -e "$src" ]; then
+              cp -r "$src" "$dest"
+              echo "✅ $name copied"
+            else
+              echo "ℹ️ $name not available"
+              mkdir -p "$dest"
+              echo "<html><body><h1>$name Unavailable</h1><p>Report not generated. Check plugin configuration.</p></body></html>" > "$dest/index.html"
+            fi
+          }
           
-          # Second: JaCoCo coverage reports
-          if [ -d "target/site/jacoco" ]; then
-            cp -r target/site/jacoco docs/reports/
-            echo "✅ JaCoCo coverage reports copied"
-          else
-            echo "ℹ️ JaCoCo reports not available"
-            mkdir -p docs/reports/jacoco
-            echo "<html><body><h1>Coverage Report Unavailable</h1><p>No coverage data generated. Ensure jacoco-maven-plugin is configured in pom.xml.</p></body></html>" > docs/reports/jacoco/index.html
-          fi
+          copy_report "target/allure-report" "docs/reports/allure-report" "Allure reports"
+          copy_report "target/site/jacoco" "docs/reports/jacoco" "JaCoCo reports"
           
-          # Third: Surefire HTML reports
           if [ -f "target/site/surefire-report.html" ]; then
-            cp target/site/surefire-report.html docs/reports/
+            cp "target/site/surefire-report.html" "docs/reports/"
             echo "✅ Surefire HTML report copied"
           else
+            echo "<html><body><h1>Test Report Unavailable</h1><p>No HTML test report generated.</p></body></html>" > "docs/reports/surefire-report.html"
             echo "ℹ️ Surefire HTML report not available"
-            echo "<html><body><h1>Test Report Unavailable</h1><p>No HTML test report generated. Ensure maven-surefire-report-plugin is configured in pom.xml and tests have run successfully.</p><p>Check target/surefire-reports/ for XML test results and verify plugin configuration.</p></body></html>" > docs/reports/surefire-report.html
           fi
           
-          echo "🎯 Reports preparation completed successfully"
+          echo "🎯 Reports preparation completed"
 
-      # Step 16: Upload artifact for GitHub Pages deployment
       - name: 📤 Upload Pages Artifact
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./docs
           retention-days: 30
-
-      # Step 17: Upload build artifacts for download
-      - name: 📤 Upload Build Artifacts
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ${{ steps.build-info.outputs.artifact-name }}-${{ steps.build-info.outputs.version }}-${{ github.run_number }}
-          path: |
-            target/*.jar
-            target/surefire-reports/
-            target/site/jacoco/
-            target/allure-report/
-            !target/*-sources.jar
-            !target/*-javadoc.jar
-          retention-days: 7
-          if-no-files-found: warn
-
-      # Step 18: Cleanup Maven cache on build failure to prevent corruption
-      - name: 🧹 Cleanup on Failure
-        if: failure()
-        run: |
-          echo "🧹 Cleaning up Maven cache due to build failure..."
-          rm -rf ~/.m2/repository/com ~/.m2/repository/org || true
-          echo "✅ Maven cache cleanup completed"
-
+          
   # =================================================================
-  # Separate Pages Deployment Job (within same workflow)
+  # STAGE 6: Production Deployment
   # =================================================================
   deploy-pages:
     name: 🌐 Deploy to GitHub Pages
-    needs: build-and-test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.build-and-test.result == 'success'
+    needs: prepare-deployment
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.prepare-deployment.result == 'success'
     runs-on: ubuntu-latest
     
-    # Specific permissions for Pages deployment
     permissions:
       pages: write
       id-token: write
       
-    # GitHub Pages environment configuration
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
       
     steps:
-      # Step 1: Setup GitHub Pages configuration
       - name: 🔧 Setup GitHub Pages
         id: pages-setup
         uses: actions/configure-pages@v4
 
-      # Step 2: Deploy to GitHub Pages
       - name: 🚀 Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
 
-      # Step 3: Generate comprehensive deployment summary
       - name: 📄 Generate Deployment Summary
         run: |
-          # Set deployment timestamp
           DEPLOY_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
           DEPLOY_DATE=$(date -u '+%B %d, %Y')
-          
-          # Extract commit info
           COMMIT_SHORT="${{ github.sha }}"
           COMMIT_SHORT=${COMMIT_SHORT:0:7}
-          COMMIT_MSG=$(git log -1 --pretty=format:'%s' 2>/dev/null || echo "N/A")
           
-          # Calculate deployment duration (approximate)
-          WORKFLOW_START="${{ github.event.head_commit.timestamp }}"
-          if [ -n "$WORKFLOW_START" ]; then
-            START_EPOCH=$(date -d "$WORKFLOW_START" +%s 2>/dev/null || echo "0")
-            CURRENT_EPOCH=$(date +%s)
-            DURATION_SEC=$((CURRENT_EPOCH - START_EPOCH))
-            DURATION_MIN=$((DURATION_SEC / 60))
-            DURATION_DISPLAY="${DURATION_MIN}m $((DURATION_SEC % 60))s"
-          else
-            DURATION_DISPLAY="N/A"
-          fi
-          
-          # Escape special characters for sed
-          DEPLOY_DATE_ESCAPED=$(echo "$DEPLOY_DATE" | sed 's/[[\.*^$()+?{|]/\\&/g')
-          DEPLOY_TIME_ESCAPED=$(echo "$DEPLOY_TIME" | sed 's/[[\.*^$()+?{|]/\\&/g')
-          COMMIT_MSG_ESCAPED=$(echo "$COMMIT_MSG" | sed 's/[[\.*^$()+?{|]/\\&/g' | sed 's/"/\\"/g')
-          
-          # Generate comprehensive summary
-          cat > temp_summary.md << EOF
+          cat >> $GITHUB_STEP_SUMMARY << EOF
           # 🚀 Production Deployment Summary
           
-          ## 📋 Deployment Overview
+          ## 📊 Deployment Status
+          | Metric | Value |
+          |--------|-------|
+          | **Status** | ✅ **SUCCESSFUL** |
+          | **Environment** | Production (GitHub Pages) |
+          | **Deployed** | ${DEPLOY_DATE} |
+          | **Build** | #${{ github.run_number }} |
+          | **Commit** | [\`${COMMIT_SHORT}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) |
           
-          | **Metric** | **Details** |
-          |------------|-------------|
-          | **🎯 Status** | <span style="color: #28a745;">✅ **SUCCESSFUL**</span> |
-          | **🌐 Environment** | **Production** (GitHub Pages) |
-          | **📅 Deployed** | ${DEPLOY_DATE} |
-          | **⏱️ Duration** | ${DURATION_DISPLAY} |
-          | **👨‍💻 Triggered By** | **${{ github.actor }}** |
-          
-          ---
-          
-          ## 🔍 Build Information
-          
-          | **Component** | **Value** | **Description** |
-          |---------------|-----------|-----------------|
-          | **📦 Artifact** | \`${{ needs.build-and-test.outputs.version }}\` | Application version |
-          | **🏷️ Build Number** | \`#${{ github.run_number }}\` | CI/CD pipeline execution |
-          | **🌿 Source Branch** | \`${{ github.ref_name }}\` | Git branch deployed |
-          | **🔑 Commit Hash** | [\`${COMMIT_SHORT}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) | Latest commit |
-          | **💬 Commit Message** | ${COMMIT_MSG} | Last change description |
+          ## 🌐 Available Resources
+          - **[📊 Quality Dashboard](${{ steps.deployment.outputs.page_url }})** - Main dashboard
+          - **[🧪 Test Results](${{ steps.deployment.outputs.page_url }}/reports/surefire-report.html)** - Unit test reports
+          - **[🎯 Coverage Analysis](${{ steps.deployment.outputs.page_url }}/reports/jacoco/)** - Code coverage
+          - **[✨ Test Analytics](${{ steps.deployment.outputs.page_url }}/reports/allure-report/)** - Interactive reports
           
           ---
-          
-          ## 🌐 Deployed Resources
-          
-          ### 🏠 Main Dashboard
-          > **[📊 Quality Dashboard](${{ steps.deployment.outputs.page_url }})** - Central hub for all project reports
-          
-          ### 📈 Available Reports
-          
-          | **Report Type** | **Purpose** | **Access Link** | **Status** |
-          |-----------------|-------------|-----------------|-------------|
-          | **🧪 Test Results** | Unit test execution summary | [View Report](${{ steps.deployment.outputs.page_url }}/reports/surefire-report.html) | ✅ Available |
-          | **🎯 Coverage Analysis** | Code coverage metrics & trends | [View Report](${{ steps.deployment.outputs.page_url }}/reports/jacoco/) | ✅ Available |
-          | **✨ Test Analytics** | Interactive test insights | [View Report](${{ steps.deployment.outputs.page_url }}/reports/allure-report/) | ✅ Available |
-          
-          ---
-          
-          ## 📊 Quality Metrics Summary
-          
-          | **Metric** | **Target** | **Current** | **Trend** |
-          |------------|------------|-------------|-----------|
-          | **Test Coverage** | ≥ 40% | *See Coverage Report* | 📈 |
-          | **Changed Files Coverage** | ≥ 60% | *See Coverage Report* | 📈 |
-          | **Test Success Rate** | 100% | *See Test Report* | ✅ |
-          | **Build Status** | ✅ Pass | ✅ Passed | 🟢 |
-          
-          ---
-          
-          ## 🔧 Technical Details
-          
-          <details>
-          <summary><strong>🛠️ Build Configuration</strong></summary>
-          
-          | **Setting** | **Value** |
-          |-------------|-----------|
-          | **Java Version** | 21 (Temurin) |
-          | **Maven Version** | Latest |
-          | **Test Framework** | JUnit 5 + Spring Boot Test |
-          | **Coverage Tool** | JaCoCo 0.8.11 |
-          | **Report Engine** | Allure 2.25.0 |
-          | **Runner** | Ubuntu Latest |
-          
-          </details>
-          
-          <details>
-          <summary><strong>🏗️ Deployment Pipeline</strong></summary>
-          
-          \`\`\`
-          📥 Source Checkout
-              ↓
-          ☕ Java 21 Setup  
-              ↓
-          📦 Dependencies Resolution
-              ↓
-          🔨 Compilation & Validation
-              ↓
-          🧪 Test Execution + Coverage
-              ↓
-          📊 Report Generation
-              ↓
-          📦 Artifact Packaging
-              ↓
-          🌐 GitHub Pages Deployment
-              ↓
-          ✅ Production Ready
-          \`\`\`
-          
-          </details>
-          
-          ---
-          
-          ## 🎉 Next Steps
-          
-          - 🔍 **Review Reports**: Check the quality dashboard for detailed insights
-          - 📈 **Monitor Trends**: Track coverage and test metrics over time  
-          - 🚨 **Set Alerts**: Configure notifications for quality threshold breaches
-          - 📝 **Documentation**: Update project documentation if needed
-          
-          ---
-          
-          ## 📞 Support & Resources
-          
-          - 🐛 **Issues**: [GitHub Issues](https://github.com/${{ github.repository }}/issues)
-          - 📚 **Wiki**: [Project Documentation](https://github.com/${{ github.repository }}/wiki)
-          - 🔄 **Workflow**: [CI/CD Pipeline](https://github.com/${{ github.repository }}/actions)
-          - 📊 **Reports**: [Quality Dashboard](${{ steps.deployment.outputs.page_url }})
-          
-          ---
-          
-          <div align="center">
-          
-          **🚀 Deployment completed successfully!**
-          
-          *Generated by GitHub Actions • Pipeline #${{ github.run_number }} • ${DEPLOY_TIME}*
-          
-          </div>
+          *Deployed successfully at ${DEPLOY_TIME}*
           EOF
-          
-          # Move the content to GitHub step summary
-          cat temp_summary.md >> $GITHUB_STEP_SUMMARY
-          
-          # Clean up
-          rm temp_summary.md
-          
-          echo "✅ Professional deployment summary generated successfully"
